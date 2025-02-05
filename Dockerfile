@@ -1,35 +1,25 @@
 # syntax=docker/dockerfile:1
 
-# Define base arguments with defaults
-ARG USE_EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
-ARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"
+# Define build args
 ARG BUILD_HASH=dev-build
-ARG UID=0
-ARG GID=0
 
 ######## WebUI Frontend Build ########
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
-ARG BUILD_HASH
 
 WORKDIR /app
 
-# Clean npm cache and increase memory limits
+# Install build dependencies
 RUN npm cache clean --force && \
     apk add --no-cache python3 make g++
 
-# Copy package files first for better caching
+# Copy package files and install dependencies
 COPY package*.json ./
-
-# Install dependencies with increased memory available
 ENV NODE_OPTIONS="--max-old-space-size=6144"
 RUN npm ci --prefer-offline --no-audit --legacy-peer-deps
 
-# Copy source files
+# Copy source and build
 COPY . .
-
-# Split build steps for better memory management
-RUN npm run pyodide:fetch
-RUN npm run build
+RUN npm run pyodide:fetch && npm run build
 
 ######## Backend Build ########
 FROM python:3.11-slim-bookworm AS base
@@ -38,19 +28,14 @@ FROM python:3.11-slim-bookworm AS base
 ENV ENV=prod \
     PORT=8080 \
     OLLAMA_BASE_URL="/ollama" \
-    OPENAI_API_BASE_URL="" \
-    OPENAI_API_KEY="" \
-    WEBUI_SECRET_KEY="" \
-    SCARF_NO_ANALYTICS=true \
-    DO_NOT_TRACK=true \
-    ANONYMIZED_TELEMETRY=false \
     WHISPER_MODEL="base" \
     WHISPER_MODEL_DIR="/app/backend/data/cache/whisper/models" \
-    RAG_EMBEDDING_MODEL="${USE_EMBEDDING_MODEL}" \
+    RAG_EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2" \
     SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models" \
-    TIKTOKEN_ENCODING_NAME="${USE_TIKTOKEN_ENCODING_NAME}" \
+    TIKTOKEN_ENCODING_NAME="cl100k_base" \
     TIKTOKEN_CACHE_DIR="/app/backend/data/cache/tiktoken" \
-    HF_HOME="/app/backend/data/cache/embedding/models"
+    HF_HOME="/app/backend/data/cache/embedding/models" \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app/backend
 
@@ -70,16 +55,25 @@ RUN apt-get update && \
     libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
+# Install Python packages in stages to better handle dependencies
 COPY backend/requirements.txt ./requirements.txt
 
-# Install pip packages optimized for CPU
-RUN pip3 install uv && \
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir && \
-    uv pip install --system -r requirements.txt --no-cache-dir && \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
-    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])" && \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"
+# Install base packages first
+RUN pip install --no-cache-dir \
+    wheel \
+    setuptools \
+    uv
+
+# Install PyTorch CPU version
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining requirements
+RUN uv pip install --system -r requirements.txt --no-cache-dir
+
+# Pre-download models
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')" && \
+    python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')" && \
+    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
 # Copy built frontend and backend files
 COPY --from=build /app/build /app/build
@@ -87,4 +81,4 @@ COPY backend .
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
