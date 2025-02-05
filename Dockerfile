@@ -1,8 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# Define build args
-ARG BUILD_HASH=dev-build
-
 ######## WebUI Frontend Build ########
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 
@@ -55,25 +52,28 @@ RUN apt-get update && \
     libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python packages in stages to better handle dependencies
+# Copy requirements
 COPY backend/requirements.txt ./requirements.txt
 
-# Install base packages first
-RUN pip install --no-cache-dir \
-    wheel \
-    setuptools \
-    uv
+# Install Python packages in stages
+RUN pip install --no-cache-dir wheel setuptools pip uv
 
 # Install PyTorch CPU version
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining requirements
-RUN uv pip install --system -r requirements.txt --no-cache-dir
+# Install dependencies with retry logic in case of transient errors
+RUN for i in $(seq 1 3); do \
+    uv pip install --system -r requirements.txt --no-cache-dir && break || \
+    sleep 5; \
+    done
 
-# Pre-download models
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')" && \
+# Pre-download models with retry logic
+RUN for i in $(seq 1 3); do \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')" && \
     python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')" && \
-    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')" && break || \
+    sleep 5; \
+    done
 
 # Copy built frontend and backend files
 COPY --from=build /app/build /app/build
@@ -81,4 +81,5 @@ COPY backend .
 
 EXPOSE 8080
 
+# Start with 2 workers for 2 vCPU system
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
