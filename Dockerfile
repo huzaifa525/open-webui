@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
-# Initialize device type args
-ARG USE_CUDA=false
+
+# Define build arguments
 ARG USE_OLLAMA=false
-ARG USE_CUDA_VER=cu121
 ARG USE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 ARG USE_RERANKING_MODEL=""
 ARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"
@@ -10,27 +9,25 @@ ARG BUILD_HASH=dev-build
 ARG UID=0
 ARG GID=0
 
-######## WebUI frontend ########
+######## WebUI Frontend Build ########
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 ARG BUILD_HASH
 
 WORKDIR /app
 
+# Copy and install dependencies
 COPY package.json package-lock.json ./
 RUN npm ci --legacy-peer-deps
 
+# Copy source files and build
 COPY . .
-
-# Increase Node.js memory to prevent heap out-of-memory errors
-ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NODE_OPTIONS="--max-old-space-size=4096"  # Prevents memory crashes
 RUN npm run build
 
-######## WebUI backend ########
+######## Backend (CPU-Only) ########
 FROM python:3.11-slim-bookworm AS base
 
-ARG USE_CUDA
 ARG USE_OLLAMA
-ARG USE_CUDA_VER
 ARG USE_EMBEDDING_MODEL
 ARG USE_RERANKING_MODEL
 ARG UID
@@ -40,8 +37,6 @@ ARG GID
 ENV ENV=prod \
     PORT=8080 \
     USE_OLLAMA_DOCKER=${USE_OLLAMA} \
-    USE_CUDA_DOCKER=${USE_CUDA} \
-    USE_CUDA_DOCKER_VER=${USE_CUDA_VER} \
     USE_EMBEDDING_MODEL_DOCKER=${USE_EMBEDDING_MODEL} \
     USE_RERANKING_MODEL_DOCKER=${USE_RERANKING_MODEL} \
     OLLAMA_BASE_URL="/ollama" \
@@ -62,43 +57,37 @@ ENV ENV=prod \
 
 WORKDIR /app/backend
 
-ENV HOME=/root
-
-# Create user if not root
+# Set up non-root user if needed
 RUN if [ $UID -ne 0 ]; then \
     if [ $GID -ne 0 ]; then \
     addgroup --gid $GID app; \
     fi; \
-    adduser --uid $UID --gid $GID --home $HOME --disabled-password --no-create-home app; \
+    adduser --uid $UID --gid $GID --home /home/app --disabled-password --no-create-home app; \
     fi
 
-RUN mkdir -p $HOME/.cache/chroma && \
-    echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry_user_id
-
-# Set permissions
-RUN chown -R $UID:$GID /app $HOME
-
-# Install dependencies (CUDA vs non-CUDA)
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git build-essential pandoc netcat-openbsd curl jq \
     gcc python3-dev ffmpeg libsm6 libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy Python dependencies and install them
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
 
+# Install dependencies for CPU-only (NO CUDA)
 RUN pip3 install uv && \
-    if [ "$USE_CUDA" = "true" ]; then \
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER --no-cache-dir; \
-    else \
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir; \
-    fi
+    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir && \
+    uv pip install --system -r requirements.txt --no-cache-dir
 
-RUN uv pip install --system -r requirements.txt --no-cache-dir && \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
+# Pre-load models to cache (for faster first-time execution)
+RUN python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
     python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])" && \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])" && \
-    chown -R $UID:$GID /app
+    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"
 
+# Set permissions
+RUN chown -R $UID:$GID /app
+
+# Copy built frontend
 COPY --from=build /app/dist /app/dist
 
 # Set entrypoint
