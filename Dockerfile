@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Define base arguments
-ARG USE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+# Define base arguments with defaults
+ARG USE_EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
 ARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"
 ARG BUILD_HASH=dev-build
 ARG UID=0
@@ -13,16 +13,22 @@ ARG BUILD_HASH
 
 WORKDIR /app
 
-# Install dependencies with clean npm state
-RUN npm cache clean --force
+# Clean npm cache and increase memory limits
+RUN npm cache clean --force && \
+    apk add --no-cache python3 make g++
 
 # Copy package files first for better caching
 COPY package*.json ./
+
+# Install dependencies with increased memory available
+ENV NODE_OPTIONS="--max-old-space-size=6144"
 RUN npm ci --prefer-offline --no-audit --legacy-peer-deps
 
-# Copy source files and build frontend
+# Copy source files
 COPY . .
-ENV NODE_OPTIONS="--max-old-space-size=2048"
+
+# Split build steps for better memory management
+RUN npm run pyodide:fetch
 RUN npm run build
 
 ######## Backend Build ########
@@ -40,9 +46,9 @@ ENV ENV=prod \
     ANONYMIZED_TELEMETRY=false \
     WHISPER_MODEL="base" \
     WHISPER_MODEL_DIR="/app/backend/data/cache/whisper/models" \
-    RAG_EMBEDDING_MODEL="$USE_EMBEDDING_MODEL" \
+    RAG_EMBEDDING_MODEL="${USE_EMBEDDING_MODEL}" \
     SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models" \
-    TIKTOKEN_ENCODING_NAME="cl100k_base" \
+    TIKTOKEN_ENCODING_NAME="${USE_TIKTOKEN_ENCODING_NAME}" \
     TIKTOKEN_CACHE_DIR="/app/backend/data/cache/tiktoken" \
     HF_HOME="/app/backend/data/cache/embedding/models"
 
@@ -65,7 +71,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
-COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
+COPY backend/requirements.txt ./requirements.txt
 
 # Install pip packages optimized for CPU
 RUN pip3 install uv && \
@@ -77,7 +83,7 @@ RUN pip3 install uv && \
 
 # Copy built frontend and backend files
 COPY --from=build /app/build /app/build
-COPY --chown=$UID:$GID ./backend .
+COPY backend .
 
 EXPOSE 8080
 
