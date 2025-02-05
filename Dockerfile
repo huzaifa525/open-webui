@@ -21,7 +21,8 @@ RUN npm ci --legacy-peer-deps
 
 # Copy source files and build
 COPY . .
-ENV NODE_OPTIONS="--max-old-space-size=4096" # Prevents memory crashes
+ENV NODE_OPTIONS="--max-old-space-size=4096" 
+# Prevents memory crashes
 RUN npm run build
 
 ######## Backend (CPU-Only) ########
